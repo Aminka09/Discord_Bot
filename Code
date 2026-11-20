@@ -2,11 +2,9 @@ import discord
 from discord.ext import commands
 from datetime import datetime, timezone, timedelta
 import re
-import aiohttp
 import traceback
 
-OWNER_ID = МОЙ_ИД
-ERROR_WEBHOOK_URL = "https://discord.com/api/webhooks/1571142918255804546/cYxG8kXKvlwyW414KzKyghP1InSLIqmiuNy6_oSsoC9z57qUPhBQsv73AUboWB26wClN"
+OWNER_ID = 1192587576998121473
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -15,7 +13,6 @@ intents.dm_messages = True
 
 bot = commands.Bot(command_prefix='!', intents=intents, owner_id=OWNER_ID)
 bot.is_active = True
-bot.log_cache = []
 
 def get_log_channel(guild):
     if not guild: return None
@@ -23,48 +20,6 @@ def get_log_channel(guild):
         if any(word in ch.name.lower() for word in ['лог', 'log', 'logs', 'mod-log']):
             return ch
     return None
-
-async def log_action(user, action, details=""):
-    if not ERROR_WEBHOOK_URL: return
-    data = {
-        "content": "",
-        "embeds": [{
-            "title": "🔔 Действие с ботом",
-            "color": 3447003,
-            "fields": [
-                {"name": "👤 Пользователь", "value": f"{user.name} (`{user.id}`)", "inline": False},
-                {"name": "📁 Действие", "value": action, "inline": False},
-                {"name": "📊 Детали", "value": details if details else "Нет", "inline": False}
-            ],
-            "footer": {"text": "Action Logger"},
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }]
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            await session.post(ERROR_WEBHOOK_URL, json=data)
-    except Exception as e:
-        print(f"Webhook Error: {e}")
-
-async def report_error(error_msg, is_traceback=False):
-    if not ERROR_WEBHOOK_URL: return
-    bot.log_cache.append(f"[{datetime.now().strftime('%d.%m %H:%M')}] {error_msg[:100]}")
-    title = "⚠️ Ошибка в боте" if is_traceback else "System Alert"
-    color = 15158332 if is_traceback else 3447003
-    if len(error_msg) > 4000: error_msg = error_msg[:4000] + "\n... (обрезано)"
-    data = {
-        "content": "",
-        "embeds": [{
-            "title": title, 
-            "description": error_msg, 
-            "color": color, 
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }]
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            await session.post(ERROR_WEBHOOK_URL, json=data)
-    except: pass
 
 def parse_footer(footer_text):
     if not footer_text: return "Неизвестно", None
@@ -121,7 +76,6 @@ async def fetch_logs(interaction, d_from, d_to, mod_filter=None, user_filter=Non
                     mod_stats[mod_name] = mod_stats.get(mod_name, 0) + 1
         return {"issued": issued, "removed": removed, "mods": mod_stats, "error": None}
     except Exception as e:
-        await report_error(str(e), True)
         return {"issued": [], "removed": [], "mods": {}, "error": str(e)}
 
 class LogView(discord.ui.View):
@@ -158,17 +112,14 @@ class LogView(discord.ui.View):
 
     @discord.ui.button(label="Выданные", style=discord.ButtonStyle.danger)
     async def b1(self, i, b): 
-        await log_action(self.user, "Кнопка: Выданные", self.period)
         await i.response.edit_message(embed=self.build_embed("issued"), view=self)
     
     @discord.ui.button(label="Снятые", style=discord.ButtonStyle.success)
     async def b2(self, i, b): 
-        await log_action(self.user, "Кнопка: Снятые", self.period)
         await i.response.edit_message(embed=self.build_embed("removed"), view=self)
     
     @discord.ui.button(label="Все", style=discord.ButtonStyle.secondary)
     async def b3(self, i, b): 
-        await log_action(self.user, "Кнопка: Все", self.period)
         await i.response.edit_message(embed=self.build_embed("all"), view=self)
 
 class ModSearchModal(discord.ui.Modal, title='Статистика модератора'):
@@ -179,7 +130,6 @@ class ModSearchModal(discord.ui.Modal, title='Статистика модера�
 
     async def on_submit(self, i):
         await i.response.defer(ephemeral=True)
-        await log_action(self.user, "Поиск статистики модератора", self.name.value)
         data = await fetch_logs(i, self.d1, self.d2, mod_filter=self.name.value)
         await i.followup.send(embed=LogView(data, self.p_name, self.user).build_embed(), view=LogView(data, self.p_name, self.user), ephemeral=True)
 
@@ -192,7 +142,6 @@ class UserSearchModal(discord.ui.Modal, title='История игрока'):
 
     async def on_submit(self, i):
         await i.response.defer(ephemeral=True)
-        await log_action(self.user_owner, "Поиск истории игрока", self.user.value)
         target = i.guild.get_member(int(self.user.value)) if self.user.value.isdigit() else discord.utils.find(lambda m: self.user.value.lower() in m.name.lower(), i.guild.members)
         if not target: return await i.followup.send("Игрок не найден", ephemeral=True)
         data = await fetch_logs(i, datetime.now(timezone.utc)-timedelta(days=int(self.days.value)), datetime.now(timezone.utc), user_filter=target)
@@ -238,7 +187,6 @@ class MainView(discord.ui.View):
                     ed = datetime.strptime(self.d2.value, '%d.%m.%Y').replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
                 except ValueError:
                     await modal_interaction.followup.send('❌ Формат даты: ДД.ММ.ГГГГ', ephemeral=True); return
-                await log_action(modal_interaction.user, "Свой период", f"С: {self.d1.value} По: {self.d2.value}")
                 data = await fetch_logs(modal_interaction, sd, ed, mod_filter=self.mod.value.strip().lower())
                 p_name = f"{self.d1.value} - {self.d2.value}"
                 await modal_interaction.followup.send(embed=LogView(data, p_name, modal_interaction.user).build_embed(), view=LogView(data, p_name, modal_interaction.user), ephemeral=True)
@@ -250,7 +198,6 @@ class MainView(discord.ui.View):
 
 @bot.tree.command(name='statsmoder', description='Панель управления логами')
 async def cmd_stats(i):
-    await log_action(i.user, "Открыл панель /statsmoder", i.guild.name)
     await i.response.send_message(view=MainView(i.user), ephemeral=True)
 
 class OwnerPanel(discord.ui.View):
@@ -262,13 +209,11 @@ class OwnerPanel(discord.ui.View):
 
     @discord.ui.button(label="Статус", style=discord.ButtonStyle.secondary, row=0, custom_id="btn_status")
     async def s(self, i, b):
-        await log_action(i.user, "Нажал 'Статус'")
         txt = "\n".join([f"{g.name} | Логи: {'✅' if get_log_channel(g) else '❌'}" for g in bot.guilds])
         await i.response.send_message(f"**Статус:**\n{txt}", ephemeral=True)
 
     @discord.ui.button(label="Обновить", style=discord.ButtonStyle.secondary, row=0, custom_id="btn_reload")
     async def r(self, i, b):
-        await log_action(i.user, "Нажал 'Обновить'")
         await bot.tree.sync()
         await i.response.send_message("Команды обновлены.", ephemeral=True)
 
@@ -276,7 +221,6 @@ class OwnerPanel(discord.ui.View):
     async def t(self, i, b):
         bot.is_active = not bot.is_active
         state = "ВКЛ" if bot.is_active else "ВЫКЛ"
-        await log_action(i.user, f"Переключил бота в {state}")
         await i.response.send_message(f"Бот теперь **{state}**", ephemeral=True)
 
 @bot.command()
@@ -289,9 +233,4 @@ async def panel(ctx):
 async def on_ready():
     print(f'Бот {bot.user} запущен!')
 
-@bot.event
-async def on_error(event, *args, **kwargs):
-    err = traceback.format_exc()
-    await report_error(err, True)
-
-bot.run('МОЙ_ТОКЕН')
+bot.run('МОЙ ТОКЕН')
