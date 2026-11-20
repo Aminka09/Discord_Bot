@@ -1,1 +1,297 @@
+import discord
+from discord.ext import commands
+from datetime import datetime, timezone, timedelta
+import re
+import aiohttp
+import traceback
 
+OWNER_ID = МОЙ_ИД
+ERROR_WEBHOOK_URL = "https://discord.com/api/webhooks/1571142918255804546/cYxG8kXKvlwyW414KzKyghP1InSLIqmiuNy6_oSsoC9z57qUPhBQsv73AUboWB26wClN"
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+intents.dm_messages = True
+
+bot = commands.Bot(command_prefix='!', intents=intents, owner_id=OWNER_ID)
+bot.is_active = True
+bot.log_cache = []
+
+def get_log_channel(guild):
+    if not guild: return None
+    for ch in guild.text_channels:
+        if any(word in ch.name.lower() for word in ['лог', 'log', 'logs', 'mod-log']):
+            return ch
+    return None
+
+async def log_action(user, action, details=""):
+    if not ERROR_WEBHOOK_URL: return
+    data = {
+        "content": "",
+        "embeds": [{
+            "title": "🔔 Действие с ботом",
+            "color": 3447003,
+            "fields": [
+                {"name": "👤 Пользователь", "value": f"{user.name} (`{user.id}`)", "inline": False},
+                {"name": "📁 Действие", "value": action, "inline": False},
+                {"name": "📊 Детали", "value": details if details else "Нет", "inline": False}
+            ],
+            "footer": {"text": "Action Logger"},
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }]
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            await session.post(ERROR_WEBHOOK_URL, json=data)
+    except Exception as e:
+        print(f"Webhook Error: {e}")
+
+async def report_error(error_msg, is_traceback=False):
+    if not ERROR_WEBHOOK_URL: return
+    bot.log_cache.append(f"[{datetime.now().strftime('%d.%m %H:%M')}] {error_msg[:100]}")
+    title = "⚠️ Ошибка в боте" if is_traceback else "System Alert"
+    color = 15158332 if is_traceback else 3447003
+    if len(error_msg) > 4000: error_msg = error_msg[:4000] + "\n... (обрезано)"
+    data = {
+        "content": "",
+        "embeds": [{
+            "title": title, 
+            "description": error_msg, 
+            "color": color, 
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }]
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            await session.post(ERROR_WEBHOOK_URL, json=data)
+    except: pass
+
+def parse_footer(footer_text):
+    if not footer_text: return "Неизвестно", None
+    parts = footer_text.split('|')
+    return (parts[0].strip(), parts[1].strip()) if len(parts) >= 2 else (footer_text.strip(), None)
+
+def extract_target_user(search_text, embed_fields):
+    m = re.search(r'<@!?(\d{17,20})>', search_text)
+    if m: return f"<@{m.group(1)}>"
+    for f in embed_fields:
+        if f.name and any(x in f.name.lower() for x in ['user', 'target', 'member']):
+            val = f.value.strip()
+            m = re.search(r'<@!?(\d{17,20})>', val)
+            if m: return f"<@{m.group(1)}>"
+            if val: return val.split('\n')[0]
+    return "Неизвестно"
+
+async def fetch_logs(interaction, d_from, d_to, mod_filter=None, user_filter=None):
+    chan = get_log_channel(interaction.guild) if interaction.guild else None
+    if not chan: return {"issued": [], "removed": [], "mods": {}, "error": "channel_not_found"}
+    issued, removed, mod_stats = [], [], {}
+    try:
+        async for msg in chan.history(limit=3000): 
+            utc_time = msg.created_at.replace(tzinfo=timezone.utc)
+            if utc_time < d_from or utc_time > d_to: continue
+            if not msg.embeds: continue
+            for e in msg.embeds:
+                title = e.title or ""
+                desc = e.description or ""
+                fields = " ".join([f"{f.name}: {f.value}" for f in e.fields]).lower()
+                if any(w in fields+title.lower() for w in ['voice', 'join', 'leave']): continue
+                mod_name, _ = parse_footer(e.footer.text if e.footer else "")
+                if mod_filter and mod_filter.lower() not in mod_name.lower(): continue
+                target = extract_target_user(f"{title} {desc} {fields}", e.fields)
+                if user_filter and user_filter.name.lower() not in target.lower() and str(user_filter.id) not in target: continue
+                is_rem = any(x in title.lower() for x in ['unmute', 'unban', 'removed', 'untimeout'])
+                is_iss = any(x in title.lower() for x in ['mute', 'ban', 'kick', 'warn', 'timeout']) and not is_rem
+                
+                entry = {
+                    "time_msk": utc_time + timedelta(hours=3),
+                    "action": title,
+                    "target": target,
+                    "moderator": mod_name,
+                    "reason": "Не указана"
+                }
+                for f in e.fields:
+                    if f.name and 'reason' in f.name.lower():
+                        entry["reason"] = f.value.strip()
+                        break
+                
+                if is_rem: removed.append(entry)
+                elif is_iss: 
+                    issued.append(entry)
+                    mod_stats[mod_name] = mod_stats.get(mod_name, 0) + 1
+        return {"issued": issued, "removed": removed, "mods": mod_stats, "error": None}
+    except Exception as e:
+        await report_error(str(e), True)
+        return {"issued": [], "removed": [], "mods": {}, "error": str(e)}
+
+class LogView(discord.ui.View):
+    def __init__(self, data, period, user):
+        super().__init__(timeout=180)
+        self.data = data
+        self.period = period
+        self.user = user
+
+    def build_embed(self, v_type="issued"):
+        if v_type == "issued": logs, color = self.data["issued"], 0xE74C3C
+        elif v_type == "removed": logs, color = self.data["removed"], 0x2ECC71
+        else: logs, color = sorted(self.data["issued"] + self.data["removed"], key=lambda x: x["time_msk"], reverse=True), 0x3498DB
+        
+        desc = f"🔢 **Найдено:** {len(logs)} шт.\n"
+        
+        if v_type == "issued" and self.data.get("mods") and not self.period.startswith("Юзер"):
+            board = ""
+            top = sorted(self.data["mods"].items(), key=lambda x: x[1], reverse=True)[:3]
+            medals = ['🥇', '🥈', '🥉']
+            for i, (m, c) in enumerate(top):
+                board += f"{medals[i]} **{m}** — {c}\n"
+            desc += f"\n🏆 **Топ:**\n{board}\n"
+        
+        desc += "\n"
+        for i, log in enumerate(logs[:15], 1):
+            desc += f"`{i}.` {log['time_msk'].strftime('%d.%m.%Y в %H:%M')} | **{log['action']}**\n"
+            desc += f"├ Модер: {log['moderator']}\n"
+            desc += f"├ Причина: {log['reason']}\n"
+            desc += f"└ Юзер: {log['target']}\n\n"
+        
+        if len(logs) > 15: desc += f"*...и еще {len(logs) - 15}*"
+        return discord.Embed(title=f"📊 Статистика ({self.period})", description=desc, color=color)
+
+    @discord.ui.button(label="Выданные", style=discord.ButtonStyle.danger)
+    async def b1(self, i, b): 
+        await log_action(self.user, "Кнопка: Выданные", self.period)
+        await i.response.edit_message(embed=self.build_embed("issued"), view=self)
+    
+    @discord.ui.button(label="Снятые", style=discord.ButtonStyle.success)
+    async def b2(self, i, b): 
+        await log_action(self.user, "Кнопка: Снятые", self.period)
+        await i.response.edit_message(embed=self.build_embed("removed"), view=self)
+    
+    @discord.ui.button(label="Все", style=discord.ButtonStyle.secondary)
+    async def b3(self, i, b): 
+        await log_action(self.user, "Кнопка: Все", self.period)
+        await i.response.edit_message(embed=self.build_embed("all"), view=self)
+
+class ModSearchModal(discord.ui.Modal, title='Статистика модератора'):
+    name = discord.ui.TextInput(label='Ник модератора', required=False)
+    def __init__(self, d1, d2, p_name, user):
+        super().__init__()
+        self.d1, self.d2, self.p_name, self.user = d1, d2, p_name, user
+
+    async def on_submit(self, i):
+        await i.response.defer(ephemeral=True)
+        await log_action(self.user, "Поиск статистики модератора", self.name.value)
+        data = await fetch_logs(i, self.d1, self.d2, mod_filter=self.name.value)
+        await i.followup.send(embed=LogView(data, self.p_name, self.user).build_embed(), view=LogView(data, self.p_name, self.user), ephemeral=True)
+
+class UserSearchModal(discord.ui.Modal, title='История игрока'):
+    user = discord.ui.TextInput(label='ID или ник игрока')
+    days = discord.ui.TextInput(label='Дней назад', default="30")
+    def __init__(self, user_owner): 
+        super().__init__()
+        self.user_owner = user_owner
+
+    async def on_submit(self, i):
+        await i.response.defer(ephemeral=True)
+        await log_action(self.user_owner, "Поиск истории игрока", self.user.value)
+        target = i.guild.get_member(int(self.user.value)) if self.user.value.isdigit() else discord.utils.find(lambda m: self.user.value.lower() in m.name.lower(), i.guild.members)
+        if not target: return await i.followup.send("Игрок не найден", ephemeral=True)
+        data = await fetch_logs(i, datetime.now(timezone.utc)-timedelta(days=int(self.days.value)), datetime.now(timezone.utc), user_filter=target)
+        await i.followup.send(embed=LogView(data, "Игрок", self.user_owner).build_embed(), view=LogView(data, "Игрок", self.user_owner), ephemeral=True)
+
+class MainView(discord.ui.View):
+    def __init__(self, user):
+        super().__init__(timeout=180)
+        self.user = user
+
+    @discord.ui.button(label="Сегодня", style=discord.ButtonStyle.success, row=0)
+    async def b1(self, i, b):
+        n = datetime.now(timezone.utc)
+        await i.response.send_modal(ModSearchModal(n.replace(hour=0, minute=0, second=0), n, "Сегодня", self.user))
+
+    @discord.ui.button(label="Вчера", style=discord.ButtonStyle.primary, row=0)
+    async def b2(self, i, b):
+        n = datetime.now(timezone.utc)
+        e = n.replace(hour=0, minute=0, second=0, microsecond=0)
+        await i.response.send_modal(ModSearchModal(e - timedelta(days=1), e, "Вчера", self.user))
+
+    @discord.ui.button(label="Неделя", style=discord.ButtonStyle.primary, row=0)
+    async def b3(self, i, b):
+        n = datetime.now(timezone.utc)
+        start = n - timedelta(days=n.weekday())
+        await i.response.send_modal(ModSearchModal(start.replace(hour=0, minute=0, second=0), n, "Неделя", self.user))
+
+    @discord.ui.button(label="Месяц", style=discord.ButtonStyle.secondary, row=0)
+    async def b4(self, i, b):
+        n = datetime.now(timezone.utc)
+        await i.response.send_modal(ModSearchModal(n - timedelta(days=30), n, "Месяц", self.user))
+
+    @discord.ui.button(label="Другое", style=discord.ButtonStyle.danger, row=1)
+    async def b5(self, i, b):
+        class CustomDateModal(discord.ui.Modal, title='Свой период'):
+            d1 = discord.ui.TextInput(label='Дата С (ДД.ММ.ГГГГ)', placeholder='01.11.2026', required=True)
+            d2 = discord.ui.TextInput(label='Дата ПО (ДД.ММ.ГГГГ)', placeholder='13.11.2026', required=True)
+            mod = discord.ui.TextInput(label='Ник модератора', placeholder='Пусто = все', required=False)
+            async def on_submit(self, modal_interaction):
+                await modal_interaction.response.defer(ephemeral=True)
+                try:
+                    sd = datetime.strptime(self.d1.value, '%d.%m.%Y').replace(hour=0, minute=0, second=0, tzinfo=timezone.utc)
+                    ed = datetime.strptime(self.d2.value, '%d.%m.%Y').replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+                except ValueError:
+                    await modal_interaction.followup.send('❌ Формат даты: ДД.ММ.ГГГГ', ephemeral=True); return
+                await log_action(modal_interaction.user, "Свой период", f"С: {self.d1.value} По: {self.d2.value}")
+                data = await fetch_logs(modal_interaction, sd, ed, mod_filter=self.mod.value.strip().lower())
+                p_name = f"{self.d1.value} - {self.d2.value}"
+                await modal_interaction.followup.send(embed=LogView(data, p_name, modal_interaction.user).build_embed(), view=LogView(data, p_name, modal_interaction.user), ephemeral=True)
+        await i.response.send_modal(CustomDateModal())
+
+    @discord.ui.button(label="🔍 Поиск по игроку", style=discord.ButtonStyle.blurple, row=1)
+    async def b6(self, i, b): 
+        await i.response.send_modal(UserSearchModal(self.user))
+
+@bot.tree.command(name='statsmoder', description='Панель управления логами')
+async def cmd_stats(i):
+    await log_action(i.user, "Открыл панель /statsmoder", i.guild.name)
+    await i.response.send_message(view=MainView(i.user), ephemeral=True)
+
+class OwnerPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction):
+        return interaction.user.id == OWNER_ID
+
+    @discord.ui.button(label="Статус", style=discord.ButtonStyle.secondary, row=0, custom_id="btn_status")
+    async def s(self, i, b):
+        await log_action(i.user, "Нажал 'Статус'")
+        txt = "\n".join([f"{g.name} | Логи: {'✅' if get_log_channel(g) else '❌'}" for g in bot.guilds])
+        await i.response.send_message(f"**Статус:**\n{txt}", ephemeral=True)
+
+    @discord.ui.button(label="Обновить", style=discord.ButtonStyle.secondary, row=0, custom_id="btn_reload")
+    async def r(self, i, b):
+        await log_action(i.user, "Нажал 'Обновить'")
+        await bot.tree.sync()
+        await i.response.send_message("Команды обновлены.", ephemeral=True)
+
+    @discord.ui.button(label="ВКЛ/ВЫКЛ", style=discord.ButtonStyle.secondary, row=1, custom_id="btn_toggle")
+    async def t(self, i, b):
+        bot.is_active = not bot.is_active
+        state = "ВКЛ" if bot.is_active else "ВЫКЛ"
+        await log_action(i.user, f"Переключил бота в {state}")
+        await i.response.send_message(f"Бот теперь **{state}**", ephemeral=True)
+
+@bot.command()
+@commands.is_owner()
+async def panel(ctx):
+    if isinstance(ctx.channel, discord.DMChannel):
+        await ctx.send("**Панель управления**", view=OwnerPanel())
+
+@bot.event
+async def on_ready():
+    print(f'Бот {bot.user} запущен!')
+
+@bot.event
+async def on_error(event, *args, **kwargs):
+    err = traceback.format_exc()
+    await report_error(err, True)
+
+bot.run('МОЙ_ТОКЕН')
